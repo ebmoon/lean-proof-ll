@@ -2,6 +2,26 @@ use serde::{Deserialize, Serialize};
 use super::json_parser::ProofData;
 use std::collections::HashMap;
 use std::path::Path;
+use nom::{
+    IResult,
+    bytes::complete::{tag, take_while1},
+    character::complete::{multispace0, multispace1, not_line_ending},
+    combinator::{opt, recognize},
+    multi::{many0, many1},
+    sequence::{delimited, terminated},
+    error::Error,
+};
+
+// Type aliases for cleaner code
+type ParseResult<'a, T> = IResult<&'a str, T, Error<&'a str>>;
+
+// Macro to simplify tag calls with proper type annotations
+macro_rules! tag_typed {
+    ($tag:literal) => {
+        tag::<&str, &str, Error<&str>>($tag)
+    };
+}
+
 
 /// Represents a Lean type expression for anti-unification
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -12,6 +32,8 @@ pub enum LeanType {
     Arrow(Box<LeanType>, Box<LeanType>),
     /// Dependent function type (e.g., `∀ (x : A), B`)
     Forall(String, Box<LeanType>, Box<LeanType>),
+    /// Existential type (e.g., `∃ (x : A), B`)
+    Exists(String, Box<LeanType>, Box<LeanType>),
     /// Application (e.g., `f x`, `Nat.Prime p`)
     App(Box<LeanType>, Box<LeanType>),
     /// Binary operation (e.g., `a * b`, `p ∣ a`)
@@ -45,7 +67,7 @@ pub enum LeanType {
 /// Enhanced hypothesis with parsed type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TypedHypothesis {
-    pub name: String,
+    pub name: Vec<String>,
     pub ty: LeanType,
 }
 
@@ -60,234 +82,360 @@ pub struct TypedParsedGoal {
 pub struct TypeParser;
 
 impl TypeParser {
-    /// Parse a Lean type expression string into a LeanType
-    pub fn parse_type(type_str: &str) -> Result<LeanType, String> {
-        let trimmed = type_str.trim();
-        Self::parse_expression(trimmed)
+
+    /// Main entry point for parsing type expressions
+    pub fn parse_type(input: &str) -> Result<LeanType, String> {
+        match Self::parse_expression(input.trim()) {
+            Ok((remaining, result)) => {
+                if remaining.trim().is_empty() {
+                    Ok(result)
+                } else {
+                    Err(format!("Unexpected input remaining: '{}'", remaining))
+                }
+            }
+            Err(e) => Err(format!("Parse error: {:?}", e)),
+        }
+    }
+
+    fn parse_parens(input: &str) -> ParseResult<'_, LeanType> {
+        delimited(multispace0, delimited(tag_typed!("("), Self::parse_expression, tag_typed!(")")), multispace0)(input)
+    }
+
+    fn parse_binary_op(input: &str) -> ParseResult<'_, LeanType> {
+        Self::parse_implication(input)
+    }
+
+    // Implication (→) - lowest precedence
+    fn parse_implication(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, mut left) = Self::parse_disjunction(input)?;
+        let mut input = input;
+        
+        loop {
+            let (input_after_space, _) = multispace0(input)?;
+            if let Ok((new_input, _)) = tag_typed!("→")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_disjunction(new_input)?;
+                left = LeanType::Implies(Box::new(left), Box::new(right));
+                input = new_input;
+            } else {
+                break;
+            }
+        }
+        
+        Ok((input, left))
+    }
+
+    // Disjunction (∨) - medium precedence
+    fn parse_disjunction(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, mut left) = Self::parse_conjunction(input)?;
+        let mut input = input;
+        
+        loop {
+            let (input_after_space, _) = multispace0(input)?;
+            if let Ok((new_input, _)) = tag_typed!("∨")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_conjunction(new_input)?;
+                left = LeanType::Or(Box::new(left), Box::new(right));
+                input = new_input;
+            } else {
+                break;
+            }
+        }
+        
+        Ok((input, left))
+    }
+
+    // Conjunction (∧) - medium precedence
+    fn parse_conjunction(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, mut left) = Self::parse_equality(input)?;
+        let mut input = input;
+        
+        loop {
+            let (input_after_space, _) = multispace0(input)?;
+            if let Ok((new_input, _)) = tag_typed!("∧")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_equality(new_input)?;
+                left = LeanType::And(Box::new(left), Box::new(right));
+                input = new_input;
+            } else {
+                break;
+            }
+        }
+        
+        Ok((input, left))
+    }
+
+    // Equality and inequality (=, ≠) - high precedence
+    fn parse_equality(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, mut left) = Self::parse_relation(input)?;
+        let mut input = input;
+        
+        loop {
+            let (input_after_space, _) = multispace0(input)?;
+            if let Ok((new_input, _)) = tag_typed!("=")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_relation(new_input)?;
+                left = LeanType::Eq(Box::new(left), Box::new(right));
+                input = new_input;
+            } else if let Ok((new_input, _)) = tag_typed!("≠")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_relation(new_input)?;
+                left = LeanType::Ne(Box::new(left), Box::new(right));
+                input = new_input;
+            } else {
+                break;
+            }
+        }
+        
+        Ok((input, left))
+    }
+
+    // Divisibility, less than (∣, <) - high precedence
+    fn parse_relation(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, mut left) = Self::parse_multiplication(input)?;
+        let mut input = input;
+        
+        loop {
+            let (input_after_space, _) = multispace0(input)?;
+            if let Ok((new_input, _)) = tag_typed!("∣")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_multiplication(new_input)?;
+                left = LeanType::Divides(Box::new(left), Box::new(right));
+                input = new_input;
+            } else if let Ok((new_input, _)) = tag_typed!("<")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_multiplication(new_input)?;
+                left = LeanType::Lt(Box::new(left), Box::new(right));
+                input = new_input;
+            } else {
+                break;
+            }
+        }
+        
+        Ok((input, left))
+    }
+
+    // Multiplication and modulo (*, %) - highest precedence
+    fn parse_multiplication(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, mut left) = Self::parse_application(input)?;
+        let mut input = input;
+        
+        loop {
+            let (input_after_space, _) = multispace0(input)?;
+            if let Ok((new_input, _)) = tag_typed!("*")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_application(new_input)?;
+                left = LeanType::Mul(Box::new(left), Box::new(right));
+                input = new_input;
+            } else if let Ok((new_input, _)) = tag_typed!("%")(input_after_space) {
+                let (new_input, _) = multispace0(new_input)?;
+                let (new_input, right) = Self::parse_application(new_input)?;
+                left = LeanType::Mod(Box::new(left), Box::new(right));
+                input = new_input;
+            } else {
+                break;
+            }
+        }
+        
+        Ok((input, left))
+    }
+
+    fn parse_quantifier(input: &str) -> ParseResult<'_, LeanType> {
+        // Universal quantifier (∀)
+        if let Ok((input, _)) = tag_typed!("∀")(input) {
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!("(")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, var_name) = Self::parse_identifier_string(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!(":")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, var_type) = Self::parse_expression(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!(")")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!(",")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, body) = Self::parse_expression(input)?;
+            
+            return Ok((input, LeanType::Forall(
+                var_name.to_string(),
+                Box::new(var_type),
+                Box::new(body)
+            )));
+        }
+        
+        // Existential quantifier (∃)
+        if let Ok((input, _)) = tag_typed!("∃")(input) {
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!("(")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, var_name) = Self::parse_identifier_string(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!(":")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, var_type) = Self::parse_expression(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!(")")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, _) = tag_typed!(",")(input)?;
+            let (input, _) = multispace0(input)?;
+            let (input, body) = Self::parse_expression(input)?;
+            
+            return Ok((input, LeanType::Exists(
+                var_name.to_string(),
+                Box::new(var_type),
+                Box::new(body)
+            )));
+        }
+        
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
+
+    fn parse_application(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, mut result) = Self::parse_atomic(input)?;
+        
+        // Parse additional applications (e.g., "Nat.Prime p" -> App(App(Nat, Prime), p))
+        let mut input = input;
+        while let Ok((new_input, _)) = multispace0::<&str, Error<&str>>(input) {
+            if let Ok((new_input, arg)) = Self::parse_atomic(new_input) {
+                result = LeanType::App(Box::new(result), Box::new(arg));
+                input = new_input;
+            } else {
+                break;
+            }
+        }
+        
+        Ok((input, result))
+    }
+
+    fn parse_atomic(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, _) = multispace0(input)?;
+        
+        // Try parentheses first
+        if let Ok((input, result)) = Self::parse_parens(input) {
+            return Ok((input, result));
+        }
+        
+        // Try negation
+        if let Ok((input, _)) = tag_typed!("¬")(input) {
+            let (input, _) = multispace0(input)?;
+            let (input, operand) = Self::parse_atomic(input)?;
+            return Ok((input, LeanType::Not(Box::new(operand))));
+        }
+        
+        // Try special constants
+        if let Ok((input, _)) = tag_typed!("False")(input) {
+            return Ok((input, LeanType::False));
+        }
+        
+        if let Ok((input, _)) = tag_typed!("True")(input) {
+            return Ok((input, LeanType::True));
+        }
+        
+        // Try to parse identifier with dot notation
+        if let Ok((input, ident)) = Self::parse_identifier(input) {
+            return Ok((input, ident));
+        }
+        
+        Err(nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))
+    }
+
+    fn parse_identifier(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, ident) = Self::parse_identifier_string(input)?;
+        let result = LeanType::Var(ident.to_string());
+        
+        Ok((input, result))
     }
 
     /// Parse an expression with precedence handling
-    fn parse_expression(expr: &str) -> Result<LeanType, String> {
-        // Handle parentheses
-        if let Some((inner, _)) = Self::parse_parens(expr) {
-            return Self::parse_expression(inner);
-        }
-
-        // Handle binary operators with precedence
-        // Lowest precedence first
-        if let Some(result) = Self::parse_binary_op(expr, "→")? {
+    fn parse_expression(input: &str) -> ParseResult<'_, LeanType> {
+        // Try quantifiers first (highest precedence)
+        if let Ok(result) = Self::parse_quantifier(input) {
             return Ok(result);
         }
-        if let Some(result) = Self::parse_binary_op(expr, "∨")? {
-            return Ok(result);
-        }
-        if let Some(result) = Self::parse_binary_op(expr, "∧")? {
-            return Ok(result);
-        }
-        if let Some(result) = Self::parse_binary_op(expr, "=")? {
-            return Ok(result);
-        }
-        if let Some(result) = Self::parse_binary_op(expr, "≠")? {
-            return Ok(result);
-        }
-        if let Some(result) = Self::parse_binary_op(expr, "∣")? {
-            return Ok(result);
-        }
-        if let Some(result) = Self::parse_binary_op(expr, "*")? {
-            return Ok(result);
-        }
-        if let Some(result) = Self::parse_binary_op(expr, "<")? {
-            return Ok(result);
-        }
-        if let Some(result) = Self::parse_binary_op(expr, "%")? {
-            return Ok(result);
-        }
-
-        // Handle unary operators
-        if expr.starts_with("¬") {
-            let inner = expr.chars().skip(1).collect::<String>().trim().to_string();
-            return Ok(LeanType::Not(Box::new(Self::parse_expression(&inner)?)));
-        }
-
-        // Handle forall
-        if expr.starts_with("∀") {
-            return Self::parse_forall(expr);
-        }
-
-        // Handle applications
-        if let Some(result) = Self::parse_application(expr)? {
-            return Ok(result);
-        }
-
-        // Handle basic variables and constants
-        Self::parse_atomic(expr)
-    }
-
-    /// Parse parentheses
-    fn parse_parens(expr: &str) -> Option<(&str, &str)> {
-        if expr.starts_with('(') {
-            let mut depth = 0;
-            for (i, c) in expr.char_indices() {
-                match c {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some((&expr[1..i], &expr[i+1..]));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        None
-    }
-
-    /// Parse binary operators
-    fn parse_binary_op(expr: &str, op: &str) -> Result<Option<LeanType>, String> {
-        let depth = 0;
-        let mut paren_depth = 0;
         
-        for (i, c) in expr.char_indices() {
-            match c {
-                '(' => paren_depth += 1,
-                ')' => paren_depth -= 1,
-                _ => {}
-            }
-            
-            if paren_depth == 0 && depth == 0 {
-                if expr[i..].starts_with(op) {
-                    let left = expr[..i].trim();
-                    let right = expr[i + op.len()..].trim();
-                    
-                    if !left.is_empty() && !right.is_empty() {
-                        let left_type = Self::parse_expression(left)?;
-                        let right_type = Self::parse_expression(right)?;
-                        
-                        let result = match op {
-                            "→" => LeanType::Implies(Box::new(left_type), Box::new(right_type)),
-                            "∨" => LeanType::Or(Box::new(left_type), Box::new(right_type)),
-                            "∧" => LeanType::And(Box::new(left_type), Box::new(right_type)),
-                            "∣" => LeanType::Divides(Box::new(left_type), Box::new(right_type)),
-                            "*" => LeanType::Mul(Box::new(left_type), Box::new(right_type)),
-                            "=" => LeanType::Eq(Box::new(left_type), Box::new(right_type)),
-                            "≠" => LeanType::Ne(Box::new(left_type), Box::new(right_type)),
-                            "<" => LeanType::Lt(Box::new(left_type), Box::new(right_type)),
-                            "%" => LeanType::Mod(Box::new(left_type), Box::new(right_type)),
-                            _ => return Err(format!("Unknown binary operator: {}", op)),
-                        };
-                        
-                        return Ok(Some(result));
-                    }
-                }
-            }
-        }
-        Ok(None)
+        // Then try binary operators
+        Self::parse_binary_op(input)
     }
 
-    /// Parse forall expressions
-    fn parse_forall(expr: &str) -> Result<LeanType, String> {
-        // Simple forall parsing: ∀ (x : A), B
-        if let Some(comma_pos) = expr.find(',') {
-            // Skip the ∀ symbol (3 bytes in UTF-8) and get the binding part
-            let binding_part_str: String = expr.chars().skip(1).take(comma_pos - 1).collect();
-            let binding_part = binding_part_str.trim();
-            let body_part = expr[comma_pos + 1..].trim();
-            
-            if let Some(colon_pos) = binding_part.find(':') {
-                let var_name = binding_part[..colon_pos].trim().trim_start_matches('(').trim();
-                let var_type_str = binding_part[colon_pos + 1..].trim().trim_end_matches(')').trim();
-                
-                let var_type = Self::parse_expression(var_type_str)?;
-                let body_type = Self::parse_expression(body_part)?;
-                
-                return Ok(LeanType::Forall(var_name.to_string(), Box::new(var_type), Box::new(body_type)));
-            }
-        }
-        Err(format!("Invalid forall expression: {}", expr))
-    }
-
-    /// Parse applications
-    fn parse_application(expr: &str) -> Result<Option<LeanType>, String> {
-        // Look for function applications like "f x" or "Nat.Prime p"
-        let parts: Vec<&str> = expr.split_whitespace().collect();
-        if parts.len() >= 2 {
-            // Try to parse as application
-            let mut result = Self::parse_atomic(parts[0])?;
-            for part in &parts[1..] {
-                let arg = Self::parse_atomic(part)?;
-                result = LeanType::App(Box::new(result), Box::new(arg));
-            }
-            return Ok(Some(result));
-        }
-        Ok(None)
-    }
-
-    /// Parse atomic expressions (variables, constants)
-    fn parse_atomic(expr: &str) -> Result<LeanType, String> {
-        let trimmed = expr.trim();
+    /// Parse a typed hypothesis line (e.g., "a b p : ℕ")
+    fn parse_typed_hypothesis_line(input: &str) -> ParseResult<'_, TypedHypothesis> {
+        let (input, _) = multispace0(input)?;
+        let (input, name) = Self::parse_identifier_list(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, _) = tag_typed!(":")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, ty_str) = Self::parse_type_expression_string(input)?;
+        let (input, _) = opt(not_line_ending)(input)?;
+        let (input, _) = multispace0(input)?;
         
-        match trimmed {
-            "False" => Ok(LeanType::False),
-            "True" => Ok(LeanType::True),
-            "ℕ" | "Nat" => Ok(LeanType::Var("Nat".to_string())),
-            _ => {
-                // Handle qualified names like "Nat.Prime"
-                if trimmed.contains('.') {
-                    let parts: Vec<&str> = trimmed.split('.').collect();
-                    let mut result = Self::parse_atomic(parts[0])?;
-                    for part in &parts[1..] {
-                        let arg = LeanType::Var(part.to_string());
-                        result = LeanType::App(Box::new(result), Box::new(arg));
-                    }
-                    Ok(result)
-                } else {
-                    Ok(LeanType::Var(trimmed.to_string()))
-                }
-            }
-        }
+        // Parse the type string into a LeanType
+        let ty = TypeParser::parse_type(ty_str)
+            .map_err(|_| nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))?;
+        
+        Ok((input, TypedHypothesis {
+            name: name.iter().map(|s| s.to_string()).collect(),
+            ty,
+        }))
     }
 
-    /// Parse a goal string into typed hypotheses and proposition
-    pub fn parse_typed_goal(goal_str: &str) -> Result<TypedParsedGoal, String> {
-        let lines: Vec<&str> = goal_str.lines().collect();
+    /// Parse a typed proposition line (e.g., "⊢ p ∣ a * b → p ∣ a ∨ p ∣ b")
+    fn parse_typed_proposition_line(input: &str) -> ParseResult<'_, LeanType> {
+        let (input, _) = multispace0(input)?;
+        let (input, _) = tag_typed!("⊢")(input)?;
+        let (input, _) = multispace1(input)?;
+        let (input, prop_str) = Self::parse_type_expression_string(input)?;
         
-        if lines.is_empty() {
-            return Err("Empty goal string".to_string());
-        }
+        // Parse the proposition string into a LeanType
+        let prop = TypeParser::parse_type(prop_str)
+            .map_err(|_| nom::Err::Error(nom::error::Error::new(input, nom::error::ErrorKind::Tag)))?;
+        
+        Ok((input, prop))
+    }
 
-        let mut hypotheses = Vec::new();
-        let mut proposition = None;
-        let mut found_turnstile = false;
+    /// Parse a list of identifiers (e.g., "a b p")
+    fn parse_identifier_list(input: &str) -> ParseResult<'_, Vec<&str>> {
+        let (input, result) = recognize(many1(terminated(
+            Self::parse_identifier_string,
+            opt(multispace1)
+        )))(input)?;
+        // Trim trailing whitespace from the result
+        let trimmed = result.trim_end();
+        Ok((input, trimmed.split_whitespace().collect()))
+    }
 
-        for line in lines {
-            let trimmed = line.trim();
-            
-            if trimmed.starts_with("⊢") {
-                // Found the proposition to prove
-                let prop_str = trimmed.chars().skip(1).collect::<String>().trim().to_string();
-                proposition = Some(Self::parse_type(&prop_str)?);
-                found_turnstile = true;
-                break;
-            } else if !trimmed.is_empty() && trimmed.contains(" : ") {
-                // This is a hypothesis
-                if let Some(colon_pos) = trimmed.find(" : ") {
-                    let name = trimmed[..colon_pos].trim().to_string();
-                    let ty_str = trimmed[colon_pos + 3..].trim().to_string();
-                    let ty = Self::parse_type(&ty_str)?;
-                    hypotheses.push(TypedHypothesis { name, ty });
-                }
-            }
-        }
+    /// Parse a single identifier
+    /// TODO: Identifier can be greek letters
+    fn parse_identifier_string(input: &str) -> IResult<&str, &str> {
+        take_while1(|c: char| c.is_alphanumeric() || c == '_' || c == '.')(input)
+    }
 
-        if !found_turnstile {
-            return Err("No turnstile (⊢) found in goal".to_string());
-        }
+    /// Parse a type expression string (everything until end of line or turnstile)
+    fn parse_type_expression_string(input: &str) -> ParseResult<'_, &str> {
+        // Take everything until we hit a newline or end of input
+        let (input, expr) = take_while1(|c: char| c != '\n' && c != '\r')(input)?;
+        Ok((input, expr.trim()))
+    }
 
-        Ok(TypedParsedGoal {
+    /// Parse a complete typed goal string
+    fn parse_typed_goal_inner(input: &str) -> ParseResult<'_, TypedParsedGoal> {
+        let (input, hypotheses) = many0(Self::parse_typed_hypothesis_line)(input)?;
+        let (input, _) = multispace0(input)?;
+        let (input, proposition) = Self::parse_typed_proposition_line(input)?;
+        let (input, _) = multispace0(input)?;
+        
+        Ok((input, TypedParsedGoal {
             hypotheses,
-            proposition: proposition.unwrap(),
-        })
+            proposition,
+        }))
+    }
+
+    pub fn parse_typed_goal(goal_str: &str) -> Result<TypedParsedGoal, String> {
+        match Self::parse_typed_goal_inner(goal_str) {
+            Ok((_, result)) => Ok(result),
+            Err(e) => Err(format!("Failed to parse typed goal: {:?}", e)),
+        }
     }
 
     /// Extract all unique typed goals from a proof data structure
@@ -351,10 +499,7 @@ mod tests {
         let type_str = "Nat.Prime p";
         let result = TypeParser::parse_type(type_str).unwrap();
         assert_eq!(result, LeanType::App(
-            Box::new(LeanType::App(
-                Box::new(LeanType::Var("Nat".to_string())),
-                Box::new(LeanType::Var("Prime".to_string()))
-            )),
+            Box::new(LeanType::Var("Nat.Prime".to_string())),
             Box::new(LeanType::Var("p".to_string()))
         ));
     }
@@ -381,9 +526,9 @@ mod tests {
         let result = TypeParser::parse_typed_goal(goal_str).unwrap();
         
         assert_eq!(result.hypotheses.len(), 2);
-        assert_eq!(result.hypotheses[0].name, "a b p");
-        assert_eq!(result.hypotheses[0].ty, LeanType::Var("Nat".to_string()));
-        assert_eq!(result.hypotheses[1].name, "hp");
+        assert_eq!(result.hypotheses[0].name, vec!["a", "b", "p"]);
+        assert_eq!(result.hypotheses[0].ty, LeanType::Var("ℕ".to_string()));
+        assert_eq!(result.hypotheses[1].name, vec!["hp"]);
         assert!(matches!(result.hypotheses[1].ty, LeanType::App(_, _)));
         assert!(matches!(result.proposition, LeanType::Implies(_, _)));
     }
@@ -399,5 +544,56 @@ mod tests {
         }
         // We'll implement proper forall parsing later
         assert!(true); // Placeholder assertion
+    }
+
+    #[test]
+    fn test_parse_exists_type() {
+        let type_str = "∃ (n : Nat), n ∣ a";
+        let result = TypeParser::parse_type(type_str).unwrap();
+        assert_eq!(result, LeanType::Exists(
+            "n".to_string(),
+            Box::new(LeanType::Var("Nat".to_string())),
+            Box::new(LeanType::Divides(
+                Box::new(LeanType::Var("n".to_string())),
+                Box::new(LeanType::Var("a".to_string()))
+            ))
+        ));
+    }
+
+    #[test]
+    fn test_parse_negation() {
+        let type_str = "¬P";
+        let result = TypeParser::parse_type(type_str).unwrap();
+        assert_eq!(result, LeanType::Not(Box::new(LeanType::Var("P".to_string()))));
+    }
+
+    #[test]
+    fn test_parse_parentheses() {
+        let type_str = "(A → B)";
+        let result = TypeParser::parse_type(type_str).unwrap();
+        assert_eq!(result, LeanType::Implies(
+            Box::new(LeanType::Var("A".to_string())),
+            Box::new(LeanType::Var("B".to_string()))
+        ));
+    }
+
+    #[test]
+    fn test_parse_equality() {
+        let type_str = "a = b";
+        let result = TypeParser::parse_type(type_str).unwrap();
+        assert_eq!(result, LeanType::Eq(
+            Box::new(LeanType::Var("a".to_string())),
+            Box::new(LeanType::Var("b".to_string()))
+        ));
+    }
+
+    #[test]
+    fn test_parse_inequality() {
+        let type_str = "a ≠ b";
+        let result = TypeParser::parse_type(type_str).unwrap();
+        assert_eq!(result, LeanType::Ne(
+            Box::new(LeanType::Var("a".to_string())),
+            Box::new(LeanType::Var("b".to_string()))
+        ));
     }
 }

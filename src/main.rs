@@ -1,60 +1,37 @@
-use lean_proof_ll::{JsonParser, TypeParser, LeanType};
+use lean_proof_ll::{TypeParser, LeanType};
 use std::env;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
     
     if args.len() < 2 {
-        println!("Usage: {} <json_file_path> [--typed]", args[0]);
+        println!("Usage: {} <json_file_path>", args[0]);
         println!("Example: {} examples/prime_subgoals.json", args[0]);
-        println!("Example: {} examples/prime_subgoals.json --typed", args[0]);
         return;
     }
 
     let file_path = &args[1];
-    let use_typed = args.len() > 2 && args[2] == "--typed";
     
-    if use_typed {
-        match TypeParser::parse_typed_goals_from_file(file_path) {
-            Ok(goals) => {
-                println!("Successfully parsed {} unique typed goals from {}", goals.len(), file_path);
-                println!();
-                
-                for (i, goal) in goals.iter().enumerate() {
-                    println!("Goal {}:", i + 1);
-                    println!("  Hypotheses:");
-                    for hyp in &goal.hypotheses {
-                        println!("    {} : {}", hyp.name, format_lean_type(&hyp.ty));
-                    }
-                    println!("  Proposition: ⊢ {}", format_lean_type(&goal.proposition));
-                    println!();
+    match TypeParser::parse_typed_goals_from_file(file_path) {
+        Ok(goals) => {
+            println!("Successfully parsed {} unique typed goals from {}", goals.len(), file_path);
+            println!();
+            
+            for (i, goal) in goals.iter().enumerate() {
+                println!("Goal {}:", i + 1);
+                println!("  Hypotheses:");
+                for hyp in &goal.hypotheses {
+                    println!("    {} : {}", hyp.name.join(" "), format_lean_type(&hyp.ty));
                 }
-            }
-            Err(e) => {
-                eprintln!("Error parsing file: {}", e);
+                println!("  Proposition: ⊢ {}", format_lean_type(&goal.proposition));
+                println!();
             }
         }
-    } else {
-        match JsonParser::parse_goals_from_file(file_path) {
-            Ok(goals) => {
-                println!("Successfully parsed {} unique goals from {}", goals.len(), file_path);
-                println!();
-                
-                for (i, goal) in goals.iter().enumerate() {
-                    println!("Goal {}:", i + 1);
-                    println!("  Hypotheses:");
-                    for hyp in &goal.hypotheses {
-                        println!("    {} : {}", hyp.name, hyp.ty);
-                    }
-                    println!("  Proposition: ⊢ {}", goal.proposition);
-                    println!();
-                }
-            }
-            Err(e) => {
-                eprintln!("Error parsing file: {}", e);
-            }
+        Err(e) => {
+            eprintln!("Error parsing file: {}", e);
         }
     }
+
 }
 
 fn format_lean_type(ty: &LeanType) -> String {
@@ -62,6 +39,7 @@ fn format_lean_type(ty: &LeanType) -> String {
         LeanType::Var(name) => name.clone(),
         LeanType::Arrow(left, right) => format!("{} → {}", format_lean_type(left), format_lean_type(right)),
         LeanType::Forall(var, var_ty, body) => format!("∀ ({} : {}), {}", var, format_lean_type(var_ty), format_lean_type(body)),
+        LeanType::Exists(var, var_ty, body) => format!("∃ ({} : {}), {}", var, format_lean_type(var_ty), format_lean_type(body)),
         LeanType::App(func, arg) => format!("{} {}", format_lean_type(func), format_lean_type(arg)),
         LeanType::BinOp(op, left, right) => format!("{} {} {}", format_lean_type(left), op, format_lean_type(right)),
         LeanType::Not(inner) => format!("¬{}", format_lean_type(inner)),
