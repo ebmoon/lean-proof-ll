@@ -12,18 +12,18 @@ fn main() {
 
     let file_path = &args[1];
     
-    match TypeParser::parse_typed_goals_from_file(file_path) {
-        Ok(goals) => {
-            println!("Successfully parsed {} unique typed goals from {}", goals.len(), file_path);
+    match TypeParser::parse_json_file(file_path) {
+        Ok(proof_data) => {
+            println!("Successfully parsed {} proof steps from {}", proof_data.proof_steps.len(), file_path);
             println!();
             
-            for (i, goal) in goals.iter().enumerate() {
+            for (i, step) in proof_data.proof_steps.iter().enumerate() {
                 println!("Goal {}:", i + 1);
                 println!("  Hypotheses:");
-                for hyp in &goal.hypotheses {
+                for hyp in &step.goals.hypotheses {
                     println!("    {} : {}", hyp.name.join(" "), format_lean_type(&hyp.ty));
                 }
-                println!("  Proposition: ⊢ {}", format_lean_type(&goal.proposition));
+                println!("  Proposition: ⊢ {}", format_lean_type(&step.goals.proposition));
                 println!();
             }
         }
@@ -38,8 +38,8 @@ fn format_lean_type(ty: &LeanType) -> String {
     match ty {
         LeanType::Var(name) => name.clone(),
         LeanType::Arrow(left, right) => format!("{} → {}", format_lean_type(left), format_lean_type(right)),
-        LeanType::Forall(var, var_ty, body) => format!("∀ ({} : {}), {}", var, format_lean_type(var_ty), format_lean_type(body)),
-        LeanType::Exists(var, var_ty, body) => format!("∃ ({} : {}), {}", var, format_lean_type(var_ty), format_lean_type(body)),
+        LeanType::Forall(var, var_ty, body) => format!("∀ ({} : {}), {}", var.join(" "), format_lean_type(var_ty), format_lean_type(body)),
+        LeanType::Exists(var, var_ty, body) => format!("∃ ({} : {}), {}", var.join(" "), format_lean_type(var_ty), format_lean_type(body)),
         LeanType::App(func, arg) => format!("{} {}", format_lean_type(func), format_lean_type(arg)),
         LeanType::BinOp(op, left, right) => format!("{} {} {}", format_lean_type(left), op, format_lean_type(right)),
         LeanType::Not(inner) => format!("¬{}", format_lean_type(inner)),
